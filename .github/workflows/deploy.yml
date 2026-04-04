@@ -34,9 +34,11 @@ jobs:
 
       - name: Verify secret exists
         run: |
-          if ! aws secretsmanager describe-secret --secret-id "$SECRET_ID" --region "$AWS_REGION" > /dev/null 2>&1; then
+          if ! aws secretsmanager describe-secret \
+              --secret-id "$SECRET_ID" \
+              --region "$AWS_REGION" > /dev/null 2>&1; then
             echo "ERROR: Secret '$SECRET_ID' not found in Secrets Manager."
-            echo "The infrastructure must be provisioned via the OrgSession-IAC pipeline before deploying."
+            echo "Run terraform apply for the target environment first."
             exit 1
           fi
 
@@ -62,37 +64,72 @@ jobs:
           ECR_REPOSITORY: ${{ steps.config.outputs.ecr_repository_name }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
+          IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
           docker build \
-            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
-            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            -t "$IMAGE" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" \
             .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          docker push "$IMAGE"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
 
-      - name: Download current task definition
+      - name: Register new task definition and deploy to ECS
         env:
+          ECS_CLUSTER: ${{ steps.config.outputs.ecs_cluster_name }}
           ECS_SERVICE: ${{ steps.config.outputs.ecs_service_name }}
+          NEW_IMAGE: ${{ steps.build.outputs.image }}
         run: |
-          aws ecs describe-task-definition \
-            --task-definition "$ECS_SERVICE" \
+          TASK_FAMILY="$ECS_SERVICE"
+
+          echo "Fetching current task definition for family: $TASK_FAMILY"
+          CURRENT=$(aws ecs describe-task-definition \
+            --task-definition "$TASK_FAMILY" \
+            --region "$AWS_REGION" \
             --query taskDefinition \
-            --output json > task-definition.json
-          echo "Downloaded task definition:"
-          cat task-definition.json
+            --output json)
 
-      - name: Render new task definition with updated image
-        id: render-task-def
-        uses: aws-actions/amazon-ecs-render-task-def@v1
-        with:
-          task-definition: task-definition.json
-          container-name: orgsession-be
-          image: ${{ steps.build.outputs.image }}
+          echo "Current image: $(echo "$CURRENT" | jq -r '.containerDefinitions[0].image')"
+          echo "New image:     $NEW_IMAGE"
 
-      - name: Deploy to ECS
-        uses: aws-actions/amazon-ecs-deploy-task-def@v2
-        with:
-          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
-          service: ${{ steps.config.outputs.ecs_service_name }}
-          cluster: ${{ steps.config.outputs.ecs_cluster_name }}
-          wait-for-service-stability: true
+          # Build a clean task definition with only the fields accepted by register-task-definition
+          # and swap the container image
+          NEW_TASK_DEF=$(echo "$CURRENT" | jq \
+            --arg IMAGE "$NEW_IMAGE" \
+            '{
+              family:                  .family,
+              executionRoleArn:        .executionRoleArn,
+              taskRoleArn:             .taskRoleArn,
+              networkMode:             .networkMode,
+              requiresCompatibilities: .requiresCompatibilities,
+              cpu:                     .cpu,
+              memory:                  .memory,
+              volumes:                 .volumes,
+              containerDefinitions: [
+                .containerDefinitions[] |
+                if .name == "orgsession-be" then .image = $IMAGE else . end
+              ]
+            }')
+
+          echo "Registering new task definition..."
+          NEW_TASK_ARN=$(aws ecs register-task-definition \
+            --region "$AWS_REGION" \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "Registered: $NEW_TASK_ARN"
+
+          echo "Updating ECS service..."
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "$NEW_TASK_ARN" \
+            --region "$AWS_REGION"
+
+          echo "Waiting for service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --region "$AWS_REGION"
+
+          echo "Deployment complete."
