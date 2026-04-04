@@ -1,0 +1,83 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - development
+      - main
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy:
+    name: Build, Push, and Deploy (${{ github.ref_name == 'main' && 'prod' || 'dev' }})
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+
+    env:
+      SECRET_ID: ${{ github.ref_name == 'main' && 'orgsession/prod/config' || 'orgsession/dev/config' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Read deployment config from Secrets Manager
+        id: config
+        run: |
+          SECRET=$(aws secretsmanager get-secret-value \
+            --secret-id "$SECRET_ID" \
+            --query SecretString \
+            --output text)
+          echo "ecr_repository_url=$(echo "$SECRET" | jq -r .ecr_repository_url)" >> "$GITHUB_OUTPUT"
+          echo "ecr_repository_name=$(echo "$SECRET" | jq -r .ecr_repository_name)" >> "$GITHUB_OUTPUT"
+          echo "ecs_cluster_name=$(echo "$SECRET"   | jq -r .ecs_cluster_name)"    >> "$GITHUB_OUTPUT"
+          echo "ecs_service_name=$(echo "$SECRET"   | jq -r .ecs_service_name)"    >> "$GITHUB_OUTPUT"
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ steps.config.outputs.ecr_repository_name }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      - name: Deploy to ECS
+        env:
+          ECS_CLUSTER: ${{ steps.config.outputs.ecs_cluster_name }}
+          ECS_SERVICE: ${{ steps.config.outputs.ecs_service_name }}
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --force-new-deployment \
+            --region "$AWS_REGION"
+
+      - name: Wait for ECS deployment to stabilize
+        env:
+          ECS_CLUSTER: ${{ steps.config.outputs.ecs_cluster_name }}
+          ECS_SERVICE: ${{ steps.config.outputs.ecs_service_name }}
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --region "$AWS_REGION"
