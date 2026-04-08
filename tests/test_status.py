@@ -23,8 +23,8 @@ def test_status_response_fields():
 def test_status_values():
     response = client.get("/status")
     data = response.json()
-    assert data["app_name"] == "OrgWide Session Demo"
-    assert data["version"] == "v3"
+    assert data["app_name"] == "OrgWide Session Demo - GitHub Actions"
+    assert data["version"] == "v2"
     assert data["status"] == "All systems operational"
 
 
